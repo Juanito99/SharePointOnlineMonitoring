@@ -1,47 +1,55 @@
-## How the Data Gets Into Log Analytics
+## Teaser
 
-Before the KQL queries can do anything, data needs to land in your Log Analytics workspace. That's what `Publish-SharePointSiteInfoToLaw.ps1` handles.
+Microsoft 365 tells you SharePoint is being used. It doesn't tell you *by whom, for what, or whether half your sites are just wasting storage*.
 
-The script runs on a schedule (via Azure Automation with a Hybrid Worker) and has two phases: collect and ingest.
+This post walks through a complete SharePoint Online monitoring solution built on Log Analytics: three PowerShell scripts that collect data from Microsoft Graph, the Purview audit API, and Entra ID, and 20 KQL queries that turn that data into actionable insights — storage trends, dormancy analysis, external access, and usage broken down by city, department, and business function.
 
-### Phase 1 — Collect from Microsoft Graph
+No custom connectors. No third-party tools. Just data you already have, made visible.
 
-It authenticates using **Managed Identity** — no credentials in the script. Secrets needed for the log ingestion app are pulled from **Azure Key Vault** at runtime.
+---
 
-Two Graph API calls are made:
+## Introduction
 
-- **`getSharePointSiteUsageDetail`** — the reports endpoint returns a per-site CSV with storage, file counts, page views, and last activity date. You can configure the lookback period: 7, 30, 90, or 180 days.
-- **`getAllSites`** — paginates through all sites to retrieve display names and web URLs. This is necessary because the reports endpoint only returns site GUIDs, not readable names.
+This dashboard provides a structured analysis of SharePoint Online using KQL-based metrics derived from site metadata, user activity events, and Entra ID user attributes collected into Log Analytics via three PowerShell scripts.
+It focuses on identifying storage growth patterns, site engagement levels, and governance gaps, while also highlighting external access exposure and organisational usage distribution.
 
-The script merges both datasets using the site GUID as the join key, producing a clean object per site with human-readable names alongside all the usage metrics.
+The queries analyse daily and 14-day storage trends, growth velocity per site, and current versus historical consumption, enabling comparison between the largest and fastest-growing sites. Activity metrics from the Purview audit stream are used to identify highly engaged sites and to distinguish active collaboration from dormant or abandoned content.
 
-> One thing worth noting: Graph's CSV responses include a UTF-8 BOM. The script strips that before parsing — a small detail that trips up a lot of implementations.
+In addition, the dashboard summarises the governance posture across the SharePoint estate, including site ownership accountability, active versus dormant classification, and inactivity thresholds at 90 and 365 days. Usage breakdowns by city, department, and business function — enriched via Entra ID attributes — connect SharePoint behaviour to organisational structure, and external access analysis covers both individual users and domains.
 
-### Phase 2 — Ingest into Log Analytics
+---
 
-Once the data is shaped, it's pushed to Log Analytics using the **Data Collection Rule (DCR) / Data Collection Endpoint (DCE)** ingestion pipeline via the `AzLogDcrIngestPS` module.
+## How the Data Gets There
 
-What that means in practice:
-- The table schema (`sharepointsiteinformation_CL`) is **automatically created or updated** if the data structure changes — no manual table management.
-- Data is posted in batches of 100 records via the Log Ingestion API.
-- The script adds a `CollectionTime` and `Computer` column to every record before posting.
+Before the queries can run, data needs to land in Log Analytics. Three PowerShell scripts handle that — and it's worth understanding what each one feeds, because the KQL queries target their output tables directly.
 
-### Key Design Choices
+**`Publish-SharePointSiteInfoToLaw.ps1`** runs on a schedule and calls the Microsoft Graph reports API to collect per-site metadata: storage used and allocated, file counts, last activity date, and page views. It enriches the data with human-readable site names (the reports API only returns GUIDs) and writes everything to the `sharepointsiteinformation_CL` table. This is the source for all storage, dormancy, and site health queries.
 
-| Decision | Reason |
-|---|---|
-| Managed Identity auth | No stored credentials, works natively in Azure Automation |
-| Key Vault for app secrets | Keeps the log ingestion app credentials out of the script and source control |
-| Graph reports endpoint | Covers all sites including those with no recent activity — more complete than usage APIs |
-| Display name enrichment | The reports API only returns GUIDs; readable names require a separate sites API call |
-| Auto schema management | Avoids breaking the pipeline when new fields are added to the output |
+**`Publish-SharePointUsageInformationToLAW_ps7.ps1`** runs hourly and pulls raw user activity events from the Microsoft Purview Management Activity API — file accesses, downloads, uploads, and page views. It filters out OneDrive and personal site traffic, deduplicates overlapping poll windows, and writes event-level records to the `sharepointusageinfo_CL` table. This is the source for all activity, external access, and usage pattern queries.
+
+**`Publish-EntraIDUsersToLAW.ps1`** runs on a schedule and retrieves all on-premises-synchronised member accounts from Entra ID via the Microsoft Graph `Get-MgUser` API. It collects identity and directory attributes — display name, UPN, department, city, company, on-premises extension attributes, and last interactive sign-in date — and writes them to the `entraidusers_CL` table. This is the enrichment source that connects SharePoint activity back to organisational structure in the usage breakdown queries.
 
 
 
-## Blog description:
+---
 
-This PowerShell script serves as the data collection layer for the SharePoint Online site metadata portion of the dashboard. It runs as an Azure Automation runbook with a Hybrid Worker and gathers per-site storage, file count, page view, and activity data across the entire SharePoint Online tenant.
+## What's in This Dashboard?
 
-The script authenticates using a managed identity and retrieves required secrets from Azure Key Vault. Site usage metrics are collected via the Microsoft Graph `getSharePointSiteUsageDetail` reports endpoint, which returns a per-site CSV covering storage consumed, active file counts, page views, and last activity date. A second Graph call to `getAllSites` paginates through the tenant to retrieve human-readable display names and web URLs, which are then merged with the usage data using the site GUID as the join key.
+With those two tables in place, 20 KQL queries cover the following areas:
 
-All collected data is normalised into a flat schema aligned with a Data Collection Rule (DCR) and ingested into Log Analytics via a Data Collection Endpoint (DCE). The table schema for `sharepointsiteinformation_CL` is automatically created or updated if the data structure changes, making the data directly available for KQL queries and dashboard visualisations without manual table management.
+**Storage & Growth**
+Track total storage today versus 30 days ago, spot the five fastest-growing sites by daily trend, and identify which sites are consuming the most quota — so you know where cleanup efforts will have the biggest impact.
+
+**Site Activity & Dormancy**
+See how many of your sites are genuinely active versus dormant. Queries surface sites with no activity in 90 or 365 days, ranked by storage size — giving you a prioritised cleanup list rather than a flat dump.
+
+**Ownership Gaps**
+Find sites that hold files but have no traceable user activity. These are your governance blind spots, and they're surfaced here before they become a compliance problem.
+
+**Usage Patterns**
+Understand which sites get the most unique users, file downloads, and active files. Break usage down by city, business function, and department — using Entra ID attributes to connect SharePoint activity back to your org structure.
+
+**External Access**
+See the top external downloaders, most-accessed sites by external users, and the top external domains — all filtered to exclude your own tenant domains.
+
+All queries are ready to drop into Log Analytics or SquaredUp. Let's walk through them.
